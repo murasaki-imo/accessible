@@ -50,6 +50,8 @@ st.set_page_config(
 import os
 from pathlib import Path
 
+GRID_ID_COL = "GRID_500M_"
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_ROOT = Path(os.getenv("DATA_ROOT", str(PROJECT_ROOT / "data")))
 
