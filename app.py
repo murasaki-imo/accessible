@@ -1526,6 +1526,14 @@ def build_multi_map_html(
         '    try{window.updateDeficitBasis(ev.newValue);}catch(e){}'
         '  }'
         '});'
+        'window.addEventListener("message",function(ev){'
+        '  try{'
+        '    if(ev.data&&ev.data.type==="deficitState"){'
+        '      var st=ev.data.state;'
+        '      Object.keys(st).forEach(function(dk){window.toggleDeficit(dk,st[dk]);});'
+        '    }'
+        '  }catch(e){}'
+        '});'
         '(function(){'
         '  try{'
         '    var b=localStorage.getItem("deficitBasis");'
@@ -1803,8 +1811,9 @@ def sgg_selector(prefix, la="Province", lb="Municipality"):
     names_in = sido_to_names.get(sido_sel, list(sgg_name_to_code))
     disp     = [_sgg(n) for n in names_in]
     sgg_disp = st.selectbox(lb, disp, key=prefix + "_sgg")
-    full     = sido_sel + "_" + sgg_disp
-    return full, sgg_name_to_code.get(full)
+    full_key  = sido_sel + "_" + sgg_disp   # 데이터 조회용 (원본 키)
+    full_disp = sido_sel + " " + sgg_disp   # 표시용
+    return full_disp, sgg_name_to_code.get(full_key)
 
 
 # ── 사이드바 ──────────────────────────────────────────
@@ -1857,53 +1866,63 @@ with st.sidebar:
     st.markdown("**Deficit overlay**")
     st.caption("Overlays deficit cell borders on the base map.")
 
-    deficit_fs = st.checkbox("F(s) — Facility siting",     value=False, key="def_fs")
-    deficit_fd = st.checkbox("F(d) — Facility dispersion", value=False, key="def_fd")
-    deficit_tc = st.checkbox("T(c) — Transit connection",  value=False, key="def_tc")
-    deficit_tf = st.checkbox("T(f) — Transit frequency",   value=False, key="def_tf")
-
-    deficit_visible = {
-        "fs": deficit_fs, "fd": deficit_fd,
-        "tc": deficit_tc, "tf": deficit_tf,
-    }
-
-    # 색상 범례
-    if any(deficit_visible.values()):
-        st.markdown(
-            "<div style='margin-top:4px;'>" +
-            "".join(
-                f"<div style='display:flex;align-items:center;gap:6px;margin-bottom:3px;'>"
-                f"<span style='width:18px;height:3px;display:inline-block;"
-                f"background:{DEFICIT_COLORS[k]};border-radius:2px;'></span>"
-                f"<span style='font-size:11px;color:#555;'>{DEFICIT_LABELS[k]}</span></div>"
-                for k in ["fs","fd","tc","tf"] if deficit_visible[k]
-            ) + "</div>",
-            unsafe_allow_html=True,
-        )
-
-    # sidebar 체크박스 변경 → localStorage로 deficit 상태 공유 (뷰포트 유지)
-    # iframe 내부에서 storage 이벤트를 수신해 toggleDeficit 호출
-    _dv_prev_key = "dv_prev"
-    dv_now  = {k: v for k, v in deficit_visible.items()}
-    dv_prev = st.session_state.get(_dv_prev_key, {})
-    changed = {k for k in dv_now if dv_now.get(k) != dv_prev.get(k)}
-    if changed:
-        # localStorage에 현재 deficit 상태 전체를 JSON으로 저장
-        import json as _json
-        dv_dict = {k: bool(v) for k, v in dv_now.items()}
-        dv_json_safe = _json.dumps(_json.dumps(dv_dict))  # 이중 직렬화로 따옴표 이스케이프
-        script = (
-            f"<script>"
-            f"(function(){{"
-            f"  var v={dv_json_safe};"
-            f"  try{{localStorage.setItem('deficitState',v);"
-            f"  window.dispatchEvent(new StorageEvent('storage',{{key:'deficitState',newValue:v}}));"
-            f"  }}catch(e){{}}"
-            f"}})();"
-            f"</script>"
-        )
-        st_components.html(script, height=0, scrolling=False)
-    st.session_state[_dv_prev_key] = dv_now
+    # ── Deficit 체크박스: 순수 HTML/JS → Python 재실행 없이 토글 ──────────────
+    # 클릭 → localStorage('deficitState') 업데이트 → iframe storage 이벤트 → toggleDeficit
+    _deficit_items = [
+        ("fs", "F(s) — Facility siting",     DEFICIT_COLORS["fs"]),
+        ("fd", "F(d) — Facility dispersion",  DEFICIT_COLORS["fd"]),
+        ("tc", "T(c) — Transit connection",   DEFICIT_COLORS["tc"]),
+        ("tf", "T(f) — Transit frequency",    DEFICIT_COLORS["tf"]),
+    ]
+    _checkbox_html = """
+<style>
+.dcb-row{display:flex;align-items:center;gap:7px;margin-bottom:5px;cursor:pointer;user-select:none;}
+.dcb-box{width:14px;height:14px;border:1.5px solid #888;border-radius:3px;
+         display:flex;align-items:center;justify-content:center;flex-shrink:0;background:#fff;}
+.dcb-box.checked{background:#444;border-color:#444;}
+.dcb-box.checked::after{content:'';width:8px;height:8px;background:#fff;
+  clip-path:polygon(14% 44%,0 65%,50% 100%,100% 16%,80% 0,43% 62%);display:block;}
+.dcb-swatch{width:18px;height:3px;border-radius:2px;flex-shrink:0;}
+.dcb-label{font-size:12px;color:#444;}
+</style>
+<div id="dcb-root">
+""" + "".join(
+        f'<div class="dcb-row" onclick="dcbToggle(\'{k}\')" id="dcb-row-{k}">'
+        f'  <div class="dcb-box" id="dcb-box-{k}"></div>'
+        f'  <span class="dcb-swatch" style="background:{color};"></span>'
+        f'  <span class="dcb-label">{label}</span>'
+        f'</div>'
+        for k, label, color in _deficit_items
+    ) + """
+</div>
+<script>
+(function(){
+  var STATE={fs:false,fd:false,tc:false,tf:false};
+  // 기존 localStorage 상태 복원
+  try{var s=localStorage.getItem('deficitState');if(s){var p=JSON.parse(s);Object.assign(STATE,p);}}catch(e){}
+  function render(){
+    Object.keys(STATE).forEach(function(k){
+      var box=document.getElementById('dcb-box-'+k);
+      if(box){if(STATE[k])box.classList.add('checked');else box.classList.remove('checked');}
+    });
+  }
+  window.dcbToggle=function(k){
+    STATE[k]=!STATE[k];
+    render();
+    try{
+      var v=JSON.stringify(STATE);
+      localStorage.setItem('deficitState',v);
+      // iframe에 직접 postMessage도 함께 전송 (cross-origin fallback)
+      document.querySelectorAll('iframe').forEach(function(f){
+        try{f.contentWindow.postMessage({type:'deficitState',state:STATE},'*');}catch(e){}
+      });
+    }catch(e){}
+  };
+  render();
+})();
+</script>
+"""
+    st_components.html(_checkbox_html, height=len(_deficit_items) * 28 + 20, scrolling=False)
 
     st.markdown("---")
     st.caption("Stations, subway lines, and facility points shown on each map.")
